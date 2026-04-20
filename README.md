@@ -6,6 +6,14 @@ output paths (CSV, RocksDB, Feather, Parquet, ...) along with the
 orchestration scripts that drive a comparative run across hypothesis
 worktrees.
 
+## Documentation
+
+See [docs/REPORT.md](docs/REPORT.md) for the full investigation report
+(background, methodology, hypotheses, results, findings, and reproducing
+steps). A Confluence Storage Format version of the same report is at
+[docs/REPORT.confluence.xhtml](docs/REPORT.confluence.xhtml) for paste
+into a Confluence page.
+
 ## Contents
 
 ```

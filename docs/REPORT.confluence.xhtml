@@ -1,0 +1,207 @@
+<!--
+  Confluence Storage Format export of docs/REPORT.md.
+  To paste into a Confluence page:
+    1. Open the target page in the editor.
+    2. Click ... menu, then "View storage format" / "View source".
+    3. Replace the body with the XHTML below.
+  Or POST the body via the REST API (PUT /rest/api/content/{id}) under "body.storage.value".
+-->
+<h1>Large Output Bug: rocprofiler-sdk Output Format Investigation</h1>
+
+<h2>Background</h2>
+<p>
+  When <code>rocprofv3</code> collects PMC counters across a real workload, the output artifact size grows out of proportion with the work being measured. A single Mistral-7B inference run that generates 50 tokens with 28 PMC counters produces multi-gigabyte output files: 1.4 GB of CSV under <code>ROCPROF_OUTPUT_FORMAT=CSV</code>, 2.1 GB of SQLite under <code>ROCPROF_OUTPUT_FORMAT=ROCPD</code>. That is impractical for users to ship, load, query, or keep around for repeated runs.
+</p>
+<p>
+  The investigation tracked here tests output format and schema changes inside <code>projects/rocprofiler-sdk/</code>. The question being answered is: <strong>which output format and schema can shrink the artifact substantially while keeping the data downstream tooling actually needs?</strong>
+</p>
+<p>
+  Each hypothesis is implemented as a feature branch on <code>ROCm/rocm-systems</code> with its own modifications to the rocprofiler-sdk output path. The harness in this repo runs the same workload against each hypothesis and records output size and timing.
+</p>
+
+<h2>Methodology</h2>
+<ul>
+  <li>Workload: Mistral-7B-v0.1 inference, prompt <code>"The capital of France is"</code>, <code>max_new_tokens=50</code>.</li>
+  <li>Counters: 28 PMC counters captured in a single pass, listed in <code>benchmark/pmc_perf_0.txt</code>.</li>
+  <li>Driver: <code>benchmark_mistral.py</code> wrapping <code>mistral.py</code>; rocprofv3 invoked once per hypothesis with the matching <code>ROCPROF_OUTPUT_FORMAT</code>.</li>
+  <li>Per-run measurements: output size in bytes, kernel/inference exec time, write time, read time, row count, unique counters.</li>
+  <li>One inference run per layout. No averaging over multiple runs.</li>
+</ul>
+
+<h2>Hypotheses</h2>
+<p>
+  All hypothesis branches live under <code>users/abchoudh/hypothesis/large_output_bug/&lt;suffix&gt;</code> on <code>ROCm/rocm-systems</code>. The two <em>(baseline)</em> rows correspond to the unmodified collector running with the indicated <code>ROCPROF_OUTPUT_FORMAT</code>.
+</p>
+<table>
+  <thead>
+    <tr>
+      <th>Layout</th>
+      <th>Branch</th>
+      <th>Format</th>
+      <th>What changed</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>CSV (baseline)</td>
+      <td><code>users/abchoudh/hypothesis/large_output_bug/baseline</code></td>
+      <td>csv</td>
+      <td>Default collector with <code>ROCPROF_OUTPUT_FORMAT=CSV</code>. Long-form text: one row per (dispatch, counter, instance).</td>
+    </tr>
+    <tr>
+      <td>ROCPD/SQLite (baseline)</td>
+      <td><code>users/abchoudh/hypothesis/large_output_bug/baseline</code></td>
+      <td>rocpd</td>
+      <td>Default collector with <code>ROCPROF_OUTPUT_FORMAT=ROCPD</code>. Long-form <code>rocpd_pmc_event</code> table with indexes, one row per (dispatch, counter, instance).</td>
+    </tr>
+    <tr>
+      <td>CSV wide per-dispatch</td>
+      <td><code>users/abchoudh/hypothesis/large_output_bug/counter_rows_per_dispatch</code></td>
+      <td>csv</td>
+      <td>One CSV row per dispatch with counters as columns; per-instance values dropped.</td>
+    </tr>
+    <tr>
+      <td>Parquet (aggregated)</td>
+      <td><code>users/abchoudh/hypothesis/large_output_bug/parquet</code></td>
+      <td>parquet</td>
+      <td>Single Parquet file per run, values summed across instances, dictionary + snappy compression.</td>
+    </tr>
+    <tr>
+      <td>Parquet (per-instance)</td>
+      <td><code>users/abchoudh/hypothesis/large_output_bug/parquet_per_instance</code></td>
+      <td>parquet</td>
+      <td>Parquet, one row per (dispatch, counter, instance); preserves per-instance values.</td>
+    </tr>
+    <tr>
+      <td>Feather (uncompressed)</td>
+      <td><code>users/abchoudh/hypothesis/large_output_bug/feather</code></td>
+      <td>feather</td>
+      <td>Apache Arrow Feather, values summed across instances, no compression.</td>
+    </tr>
+    <tr>
+      <td>RocksDB (aggregated)</td>
+      <td><code>users/abchoudh/hypothesis/large_output_bug/rocksdb_aggregated</code></td>
+      <td>rocksdb</td>
+      <td>One RocksDB key per dispatch, values summed across instances.</td>
+    </tr>
+    <tr>
+      <td>RocksDB (per-instance)</td>
+      <td><code>users/abchoudh/hypothesis/large_output_bug/rocksdb</code></td>
+      <td>rocksdb</td>
+      <td>One RocksDB key per dispatch; per-instance counter entries packed into a binary blob value.</td>
+    </tr>
+    <tr>
+      <td>ROCPD aggregated PMC</td>
+      <td><code>users/abchoudh/hypothesis/large_output_bug/rocpd_aggregated_pmc</code></td>
+      <td>rocpd</td>
+      <td>rocpd/sqlite default schema, values summed across instances before insert.</td>
+    </tr>
+    <tr>
+      <td>ROCPD wide JSONB PMC</td>
+      <td><code>users/abchoudh/hypothesis/large_output_bug/rocpd_wide_pmc</code></td>
+      <td>rocpd</td>
+      <td>rocpd/sqlite with <code>value REAL</code> replaced by <code>values JSONB</code> array holding per-instance values.</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>Results</h2>
+<p>
+  Sorted smallest output first. <em>vs CSV</em> and <em>vs ROCPD</em> are size-reduction multiples against the two baselines. Sizes are reported in human units (1 MB = 1,000,000 B, 1 GB = 1,000,000,000 B).
+</p>
+<table>
+  <thead>
+    <tr>
+      <th>Layout</th>
+      <th style="text-align:right;">Output size</th>
+      <th style="text-align:right;">vs CSV</th>
+      <th style="text-align:right;">vs ROCPD</th>
+      <th style="text-align:right;">write (s)</th>
+      <th style="text-align:right;">read (s)</th>
+      <th style="text-align:right;">rows</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>Parquet (aggregated)</td><td style="text-align:right;">12.2 MB</td><td style="text-align:right;">124x</td><td style="text-align:right;">180x</td><td style="text-align:right;">3.48</td><td style="text-align:right;">2.78</td><td style="text-align:right;">2,607,108</td></tr>
+    <tr><td>RocksDB (aggregated)</td><td style="text-align:right;">49.7 MB</td><td style="text-align:right;">30x</td><td style="text-align:right;">44x</td><td style="text-align:right;">1.04</td><td style="text-align:right;">0.83</td><td style="text-align:right;">2,607,108</td></tr>
+    <tr><td>Parquet (per-instance)</td><td style="text-align:right;">51.5 MB</td><td style="text-align:right;">29x</td><td style="text-align:right;">42x</td><td style="text-align:right;">35.18</td><td style="text-align:right;">30.10</td><td style="text-align:right;">35,472,240</td></tr>
+    <tr><td>CSV wide per-dispatch</td><td style="text-align:right;">81.6 MB</td><td style="text-align:right;">18x</td><td style="text-align:right;">27x</td><td style="text-align:right;">0.00</td><td style="text-align:right;">0.76</td><td style="text-align:right;">93,114</td></tr>
+    <tr><td>ROCPD aggregated PMC</td><td style="text-align:right;">277.9 MB</td><td style="text-align:right;">5.4x</td><td style="text-align:right;">7.9x</td><td style="text-align:right;">4.09</td><td style="text-align:right;">0.34</td><td style="text-align:right;">2,607,108</td></tr>
+    <tr><td>ROCPD wide JSONB PMC</td><td style="text-align:right;">409.3 MB</td><td style="text-align:right;">3.7x</td><td style="text-align:right;">5.4x</td><td style="text-align:right;">6.40</td><td style="text-align:right;">0.49</td><td style="text-align:right;">2,607,108</td></tr>
+    <tr><td>RocksDB (per-instance)</td><td style="text-align:right;">551.6 MB</td><td style="text-align:right;">2.7x</td><td style="text-align:right;">4.0x</td><td style="text-align:right;">2.85</td><td style="text-align:right;">0.59</td><td style="text-align:right;">35,382,180</td></tr>
+    <tr><td>Feather (uncompressed)</td><td style="text-align:right;">1.4 GB</td><td style="text-align:right;">1.0x</td><td style="text-align:right;">1.5x</td><td style="text-align:right;">3.40</td><td style="text-align:right;">2.16</td><td style="text-align:right;">2,607,108</td></tr>
+    <tr><td>CSV (baseline)</td><td style="text-align:right;">1.4 GB</td><td style="text-align:right;">1x</td><td style="text-align:right;">1.5x</td><td style="text-align:right;">0.00</td><td style="text-align:right;">10.08</td><td style="text-align:right;">2,607,111</td></tr>
+    <tr><td>ROCPD/SQLite (baseline)</td><td style="text-align:right;">2.1 GB</td><td style="text-align:right;">0.7x</td><td style="text-align:right;">1x</td><td style="text-align:right;">30.10</td><td style="text-align:right;">2.47</td><td style="text-align:right;">35,382,180</td></tr>
+  </tbody>
+</table>
+
+<h2>Findings</h2>
+<p>Three groupings show up clearly in the data.</p>
+
+<h3>Row-count groupings</h3>
+<p>
+  The 10 layouts cluster into three row-count buckets, and the bucket alone explains a large part of the size spread:
+</p>
+<table>
+  <thead>
+    <tr>
+      <th>Row count</th>
+      <th>Layouts</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>~35.4M rows (per-instance preserved)</td><td>ROCPD/SQLite (baseline), RocksDB (per-instance), Parquet (per-instance)</td></tr>
+    <tr><td>~2.6M rows (per-counter aggregated across instances)</td><td>CSV (baseline), Parquet (aggregated), Feather (uncompressed), RocksDB (aggregated), ROCPD aggregated PMC, ROCPD wide JSONB PMC</td></tr>
+    <tr><td>~93k rows (per-dispatch wide)</td><td>CSV wide per-dispatch</td></tr>
+  </tbody>
+</table>
+
+<h3>Schema shape alone is a major lever</h3>
+<p>
+  Going from "one row per (dispatch, counter, instance)" to "one row per dispatch with counters as columns" cuts CSV from 1.4 GB to 81.6 MB without changing storage format or sacrificing text compatibility. The row count drops from 2.6M to 93k.
+</p>
+
+<h3>Format choice still matters within the same schema shape</h3>
+<p>
+  Inside the ~2.6M-row aggregated group, picking the right binary format dominates: Parquet (aggregated) is 12.2 MB, RocksDB (aggregated) is 49.7 MB, ROCPD aggregated PMC is 277.9 MB, ROCPD wide JSONB PMC is 409.3 MB, and Feather (uncompressed) stays at 1.4 GB. That is a ~115x spread within identical row counts, driven entirely by encoding and compression.
+</p>
+
+<h3>Per-instance fidelity is affordable in columnar binary</h3>
+<p>
+  Parquet (per-instance) keeps the full 35.5M-row representation but lands at 51.5 MB, while the other per-instance-preserving layouts (RocksDB at 551.6 MB, baseline ROCPD at 2.1 GB) are roughly an order of magnitude larger.
+</p>
+
+<h2>Reproducing</h2>
+<p>
+  The harness lives at <a href="https://github.com/abchoudh-amd/large_output_bug_benchmark">https://github.com/abchoudh-amd/large_output_bug_benchmark</a>. Each hypothesis is a separate branch on <code>ROCm/rocm-systems</code> (see the Hypotheses table for the full branch name of each layout).
+</p>
+<p>Steps:</p>
+<ol>
+  <li>
+    <p>Clone the harness:</p>
+    <ac:structured-macro ac:name="code">
+      <ac:parameter ac:name="language">bash</ac:parameter>
+      <ac:plain-text-body><![CDATA[git clone https://github.com/abchoudh-amd/large_output_bug_benchmark.git harness
+cd harness]]></ac:plain-text-body>
+    </ac:structured-macro>
+  </li>
+  <li>
+    <p>For each hypothesis you want to measure, clone <code>ROCm/rocm-systems</code> on the matching branch and build the rocprofiler-sdk from <code>projects/rocprofiler-sdk/</code> using its standard CMake build. Example for <code>parquet</code>:</p>
+    <ac:structured-macro ac:name="code">
+      <ac:parameter ac:name="language">bash</ac:parameter>
+      <ac:plain-text-body><![CDATA[git clone --branch users/abchoudh/hypothesis/large_output_bug/parquet \
+          --depth 1 \
+          https://github.com/ROCm/rocm-systems.git rocm-systems-parquet
+cmake -S rocm-systems-parquet/projects/rocprofiler-sdk -B build-parquet
+cmake --build build-parquet --target install]]></ac:plain-text-body>
+    </ac:structured-macro>
+  </li>
+  <li>
+    <p>
+      Drive the Mistral run with <code>benchmark_mistral.py</code>, pointing at the freshly built rocprofiler-sdk install. The script invokes <code>rocprofv3</code> once with the 28 PMC counters from <code>benchmark/pmc_perf_0.txt</code> and captures <code>output_bytes</code>, <code>exec_sec</code>, <code>write_sec</code>, <code>read_sec</code>, <code>rows</code>, and <code>unique_counters</code> into a CSV that lines up directly with the Results table above.
+    </p>
+  </li>
+</ol>
+<p>
+  Note: <code>run_benchmark.sh</code> in this harness assumes <code>${SCRIPT_DIR}/&lt;branch_suffix&gt;/</code> sibling directories holding each hypothesis worktree. The harness README calls this out. The minimal Mistral reproduction described above can be driven through <code>benchmark_mistral.py</code> directly without that layout, by pointing it at one rocprofiler-sdk install at a time.
+</p>
