@@ -47,6 +47,8 @@ KNOWN_HYPOTHESES = (
     "parquet_per_instance",
     "rocksdb",
     "rocksdb_aggregated",
+    "lz4",
+    "zstd",
 )
 FORMAT_MAP = {
     "baseline": ("csv", "rocpd"),
@@ -59,6 +61,8 @@ FORMAT_MAP = {
     "parquet_per_instance": ("parquet",),
     "rocksdb": ("rocksdb",),
     "rocksdb_aggregated": ("rocksdb",),
+    "lz4": ("rocpd",),
+    "zstd": ("rocpd",),
 }
 FORMAT_GLOB_MAP = {
     "csv": ("*.csv",),
@@ -79,6 +83,8 @@ CONSOLIDATED_NAME_MAP = {
     ("parquet_per_instance", "parquet"): "parquet_per_instance",
     ("rocksdb", "rocksdb"): "rocksdb",
     ("rocksdb_aggregated", "rocksdb"): "rocksdb_aggregated",
+    ("lz4", "rocpd"): "rocpd_lz4",
+    ("zstd", "rocpd"): "rocpd_zstd",
 }
 SUPPORTED_FORMATS = set(FORMAT_GLOB_MAP)
 
@@ -1579,7 +1585,8 @@ def add_shared_options(parser: argparse.ArgumentParser) -> None:
         help=(
             "Comma-separated hypothesis names to run "
             "(default: auto-discover baseline,counter_rows_per_dispatch,"
-            "csv_per_dispatch_flushed,rocpd_wide_pmc,feather,parquet,rocksdb)"
+            "csv_per_dispatch_flushed,rocpd_wide_pmc,feather,parquet,rocksdb,"
+            "lz4,zstd)"
         ),
     )
     parser.add_argument(

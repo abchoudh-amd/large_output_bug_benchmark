@@ -11,7 +11,7 @@ writes per-tier CSV results plus one consolidated CSV.
 
 Options:
   --hypotheses LIST         Comma-separated hypothesis names to run
-                            (default: auto-discover baseline,counter_rows_per_dispatch,feather,parquet)
+                            (default: auto-discover baseline,counter_rows_per_dispatch,feather,parquet,lz4,zstd)
   --tiers LIST              Comma-separated dispatch tiers (default: 100,10000,100000)
   --counter-file PATH       TXT file with pmc counter group (required for multi-counter;
                             default: <script>/benchmark/pmc_perf_0.txt)
@@ -32,13 +32,15 @@ Output files:
   <results-dir>/all_results.csv
   <results-dir>/raw/<hypothesis>/tier_<tier>/<format>/
   all_results.csv schema: name,num_dispatch,size,read_time,exec_time
-  all_results.csv names: csv_baseline,rocpd_baseline,csv_per_dispatch,feather,parquet
+  all_results.csv names: csv_baseline,rocpd_baseline,csv_per_dispatch,feather,parquet,rocpd_lz4,rocpd_zstd
 
 Default output formats per hypothesis:
   baseline                  csv,rocpd
   counter_rows_per_dispatch csv
   feather                   feather
   parquet                   parquet
+  lz4                       rocpd
+  zstd                      rocpd
 EOF
 }
 
@@ -51,7 +53,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCHMARK_SRC="${SCRIPT_DIR}/benchmark/synthetic_dispatch_benchmark.cpp"
 BENCHMARK_BUILD_DIR="${SCRIPT_DIR}/benchmark/build"
 BENCHMARK_BIN="${BENCHMARK_BUILD_DIR}/synthetic_dispatch_benchmark"
-KNOWN_HYPOTHESES=(baseline counter_rows_per_dispatch feather parquet)
+KNOWN_HYPOTHESES=(baseline counter_rows_per_dispatch feather parquet lz4 zstd)
 CONSOLIDATED_HEADER="name,num_dispatch,size,read_time,exec_time"
 
 HYPOTHESES_CSV=""
@@ -171,6 +173,8 @@ get_formats_for_hypothesis() {
         counter_rows_per_dispatch) echo "csv" ;;
         feather) echo "feather" ;;
         parquet) echo "parquet" ;;
+        lz4) echo "rocpd" ;;
+        zstd) echo "rocpd" ;;
         *) die "Unknown hypothesis for format mapping: ${hypothesis}" ;;
     esac
 }
@@ -195,6 +199,8 @@ get_consolidated_name() {
         counter_rows_per_dispatch:csv) echo "csv_per_dispatch" ;;
         feather:feather) echo "feather" ;;
         parquet:parquet) echo "parquet" ;;
+        lz4:rocpd) echo "rocpd_lz4" ;;
+        zstd:rocpd) echo "rocpd_zstd" ;;
         *) die "No consolidated name mapping for hypothesis=${hypothesis}, format=${format}" ;;
     esac
 }
