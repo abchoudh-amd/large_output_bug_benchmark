@@ -1,0 +1,7 @@
+# Runtime dependencies for the large_output_bug benchmark harness.
+#
+# `lz4` is required by run_benchmark.measure_rocpd_decompression to register
+# the lz4_decompress SQL function on connections opened against LZ4-compressed
+# rocpd databases. Matches the lower bound declared by the LZ4 hypothesis SDK
+# itself in lz4/projects/rocprofiler-sdk/requirements.txt.
+lz4>=4.0

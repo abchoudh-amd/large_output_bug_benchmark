@@ -119,6 +119,7 @@ class FormatMetrics:
     row_count: int
     unique_counters: int
     output_dir: Path
+    decompress_sec: float = 0.0
 
 
 def log(message: str) -> None:
@@ -473,6 +474,193 @@ def measure_rocpd_read(root_dir: Path, dry_run: bool) -> tuple[float, int, int]:
             conn.close()
     elapsed = time.perf_counter() - start
     return elapsed, pmc_rows, unique_counters
+
+
+_LZ4_BLOB_MAGIC = b"LZ4F"
+
+LZ4_DECOMPRESS_VIEWS = (
+    "rocpd_info_process",
+    "rocpd_info_thread",
+    "rocpd_info_agent",
+    "rocpd_info_queue",
+    "rocpd_info_stream",
+    "rocpd_info_pmc",
+    "rocpd_info_code_object",
+    "rocpd_info_kernel_symbol",
+    "rocpd_track",
+    "rocpd_event",
+    "rocpd_arg",
+    "rocpd_pmc_event",
+    "rocpd_region",
+    "rocpd_sample",
+    "rocpd_kernel_dispatch",
+    "rocpd_memory_copy",
+    "rocpd_memory_allocate",
+)
+
+ZSTD_COMPRESSED_TABLES = (
+    "rocpd_string",
+    "rocpd_info_process",
+    "rocpd_info_thread",
+    "rocpd_info_agent",
+    "rocpd_info_queue",
+    "rocpd_info_stream",
+    "rocpd_region",
+    "rocpd_sample",
+    "rocpd_kernel_dispatch",
+    "rocpd_memory_copy",
+    "rocpd_memory_allocate",
+)
+
+
+def _lz4_blob_decompress(value: bytes | None) -> bytes:
+    """Decompress an LZ4-frame BLOB written with the rocpd magic+length prefix."""
+    if value is None:
+        return b""
+    payload = bytes(value)
+    if not payload:
+        return b""
+    if len(payload) < 8 or payload[:4] != _LZ4_BLOB_MAGIC:
+        raise ValueError("invalid lz4 blob magic")
+    expected = struct.unpack("<I", payload[4:8])[0]
+    import lz4.frame  # type: ignore[import-not-found]
+
+    output = lz4.frame.decompress(payload[8:])
+    if len(output) != expected:
+        raise ValueError("lz4 length mismatch")
+    return output
+
+
+def detect_rocpd_compression(db_path: Path) -> str | None:
+    """Return 'lz4', 'zstd', or None based on rocpd_metadata tags in db_path."""
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name LIKE 'rocpd_metadata%'"
+            )
+            metadata_tables = [row[0] for row in cur.fetchall()]
+        except sqlite3.Error:
+            return None
+        for table_name in metadata_tables:
+            try:
+                cur.execute(f'SELECT tag, value FROM "{table_name}"')
+                tags = {str(row[0]): str(row[1]) for row in cur.fetchall()}
+            except sqlite3.Error:
+                continue
+            compression = tags.get("compression", "").lower()
+            if compression.startswith("lz4"):
+                return "lz4"
+            sqlite_zstd = tags.get("sqlite_zstd", "").lower()
+            if sqlite_zstd in ("1", "true", "enabled", "on"):
+                return "zstd"
+    finally:
+        conn.close()
+    return None
+
+
+def find_sqlite_zstd_lib(sdk_prefix: Path | None) -> Path | None:
+    """Locate libsqlite_zstd.so via env var or known SDK install layout."""
+    env_path = os.environ.get("ROCPROFILER_SQLITE_ZSTD_LIBPATH")
+    if env_path:
+        candidate = Path(env_path).expanduser()
+        if candidate.is_file():
+            return candidate
+    if sdk_prefix is None:
+        return None
+    for libdir in ("lib", "lib64"):
+        candidate = sdk_prefix / libdir / "rocprofiler-sdk-rocpd" / "libsqlite_zstd.so"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def register_rocpd_compression(
+    conn: sqlite3.Connection,
+    mode: str,
+    *,
+    sdk_prefix: Path | None = None,
+) -> bool:
+    """Register lz4_decompress or load libsqlite_zstd.so on conn for this mode."""
+    if mode == "lz4":
+        try:
+            import lz4.frame  # type: ignore[import-not-found, unused-ignore]  # noqa: F401
+        except ModuleNotFoundError:
+            warn(
+                "lz4 python package missing; skipping decompression timing for LZ4 db. "
+                "Install with: pip install 'lz4>=4.0'"
+            )
+            return False
+        try:
+            conn.create_function(
+                "lz4_decompress", 1, _lz4_blob_decompress, deterministic=True
+            )
+        except TypeError:
+            conn.create_function("lz4_decompress", 1, _lz4_blob_decompress)
+        return True
+    if mode == "zstd":
+        lib_path = find_sqlite_zstd_lib(sdk_prefix)
+        if lib_path is None:
+            warn(
+                "libsqlite_zstd.so not found "
+                f"(sdk_prefix={sdk_prefix}, ROCPROFILER_SQLITE_ZSTD_LIBPATH unset); "
+                "skipping decompression timing for ZSTD db"
+            )
+            return False
+        try:
+            conn.enable_load_extension(True)
+            conn.load_extension(str(lib_path))
+        except (
+            sqlite3.OperationalError,
+            sqlite3.NotSupportedError,
+            AttributeError,
+        ) as exc:
+            warn(f"failed to load libsqlite_zstd.so from {lib_path}: {exc}")
+            return False
+        return True
+    return False
+
+
+def measure_rocpd_decompression(
+    root_dir: Path,
+    *,
+    sdk_prefix: Path | None = None,
+    dry_run: bool = False,
+) -> float:
+    """Measure end-to-end decompression-while-reading time across rocpd .db files."""
+    if dry_run or not root_dir.exists():
+        return 0.0
+    db_files = sorted(path for path in root_dir.rglob("*.db") if path.is_file())
+    total_elapsed = 0.0
+    for db_path in db_files:
+        mode = detect_rocpd_compression(db_path)
+        if mode is None:
+            continue
+        conn = sqlite3.connect(str(db_path))
+        try:
+            if not register_rocpd_compression(conn, mode, sdk_prefix=sdk_prefix):
+                continue
+            views = LZ4_DECOMPRESS_VIEWS if mode == "lz4" else ZSTD_COMPRESSED_TABLES
+            cur = conn.cursor()
+            start = time.perf_counter()
+            for view_name in views:
+                try:
+                    cur.execute(f'SELECT * FROM "{view_name}"')
+                except sqlite3.Error:
+                    continue
+                while True:
+                    rows = cur.fetchmany(1024)
+                    if not rows:
+                        break
+            total_elapsed += time.perf_counter() - start
+        finally:
+            conn.close()
+    return total_elapsed
 
 
 def measure_feather_read(root_dir: Path, dry_run: bool) -> tuple[float, int, int]:

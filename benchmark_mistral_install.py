@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import dataclasses
 import importlib.util
 import re
 import shlex
@@ -47,6 +48,7 @@ PER_INSTALL_HEADER = (
     "exec_max_sec",
     "write_sec",
     "read_sec",
+    "decompress_sec",
     "rows",
     "unique_counters",
     "output_dir",
@@ -61,6 +63,7 @@ CONSOLIDATED_HEADER = (
     "exec_sec",
     "write_sec",
     "read_sec",
+    "decompress_sec",
     "rows",
     "unique_counters",
 )
@@ -418,6 +421,13 @@ def main(argv: list[str] | None = None) -> int:
             )
 
             metrics = rb.measure_format(output_format, output_dir, exec_sec, args.dry_run)
+            if output_format == "rocpd":
+                decompress_sec = rb.measure_rocpd_decompression(
+                    output_dir,
+                    sdk_prefix=sdk_prefix,
+                    dry_run=args.dry_run,
+                )
+                metrics = dataclasses.replace(metrics, decompress_sec=decompress_sec)
             exec_min = min(exec_times)
             exec_max = max(exec_times)
             log(
@@ -427,6 +437,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"max={format_seconds(exec_max)}s "
                 f"write={format_seconds(metrics.write_sec)}s "
                 f"read={format_seconds(metrics.read_sec)}s "
+                f"decompress={format_seconds(metrics.decompress_sec)}s "
                 f"rows={metrics.row_count} "
                 f"unique_counters={metrics.unique_counters}"
             )
@@ -445,6 +456,7 @@ def main(argv: list[str] | None = None) -> int:
                     format_seconds(exec_max),
                     format_seconds(metrics.write_sec),
                     format_seconds(metrics.read_sec),
+                    format_seconds(metrics.decompress_sec),
                     str(metrics.row_count),
                     str(metrics.unique_counters),
                     str(output_dir),
@@ -460,6 +472,7 @@ def main(argv: list[str] | None = None) -> int:
                     format_seconds(metrics.exec_sec),
                     format_seconds(metrics.write_sec),
                     format_seconds(metrics.read_sec),
+                    format_seconds(metrics.decompress_sec),
                     str(metrics.row_count),
                     str(metrics.unique_counters),
                 ]
